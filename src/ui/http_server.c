@@ -1931,10 +1931,19 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req,
             yyjson_mut_obj_add_str(doc, root, "status", "corrupt");
             yyjson_mut_obj_add_str(doc, root, "reason", "cannot open");
         } else {
-            yyjson_mut_obj_add_str(doc, root, "status", "healthy");
-            yyjson_mut_obj_add_int(doc, root, "nodes", cbm_store_count_nodes(store, name));
-            yyjson_mut_obj_add_int(doc, root, "edges", cbm_store_count_edges(store, name));
-            yyjson_mut_obj_add_int(doc, root, "size_bytes", cbm_file_size(db_path));
+            int nodes = cbm_store_count_nodes(store, name);
+            int edges = cbm_store_count_edges(store, name);
+            /* A negative count is a failed read (CBM_STORE_ERR), not a count:
+             * it must stay distinct from the healthy 0 of an empty project. */
+            if (nodes < 0 || edges < 0) {
+                yyjson_mut_obj_add_str(doc, root, "status", "corrupt");
+                yyjson_mut_obj_add_str(doc, root, "reason", "cannot read node/edge counts");
+            } else {
+                yyjson_mut_obj_add_str(doc, root, "status", "healthy");
+                yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
+                yyjson_mut_obj_add_int(doc, root, "edges", edges);
+                yyjson_mut_obj_add_int(doc, root, "size_bytes", cbm_file_size(db_path));
+            }
             (void)cbm_store_get_project(store, name, &project);
             cbm_store_close(store);
         }

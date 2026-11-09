@@ -2863,7 +2863,7 @@ TEST(ui_server_project_health_timestamp_and_no_watcher) {
     ASSERT_NOT_NULL(project.indexed_at);
     ASSERT_TRUE(project.indexed_at[0] != '\0');
     cbm_store_close(store);
-    /* This endpoint's corrupt branch means "cannot open". A text file is not
+    /* This fixture has to reach the "cannot open" reason. A text file is not
      * sufficient: the store's immutable fallback opens lazily and can return
      * a handle before discovering invalid contents. An existing directory
      * makes both open attempts fail, independently of file permissions. */
@@ -2884,6 +2884,72 @@ TEST(ui_server_project_health_timestamp_and_no_watcher) {
     ASSERT_TRUE(healthy);
     ASSERT_TRUE(missing);
     ASSERT_TRUE(corrupt);
+    PASS();
+}
+
+/* One parsed /api/project-health reply, or NULL if the exchange failed. */
+static yyjson_doc *ui_health_reply(th_server_t *server, const char *project) {
+    char request[512], response[4096];
+    snprintf(request, sizeof(request), "GET /api/project-health?name=%s HTTP/1.1\r\n\r\n", project);
+    int length = th_http(cbm_http_server_port(server->srv), request, response, sizeof(response));
+    if (length <= 0 || th_status(response) != 200)
+        return NULL;
+    const char *body = strstr(response, "\r\n\r\n");
+    return body ? yyjson_read(body + 4, strlen(body + 4), 0) : NULL;
+}
+
+/* The reply says the count read failed and carries no count. A function of its
+ * own because ASSERT returns: the caller still frees this reply and checks the
+ * next one. */
+static int ui_health_assert_failed_read(yyjson_doc *reply) {
+    ASSERT_NOT_NULL(reply);
+    yyjson_val *root = yyjson_doc_get_root(reply);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "status")), "corrupt");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "reason")), "cannot read node/edge counts");
+    ASSERT_NULL(yyjson_obj_get(root, "nodes"));
+    ASSERT_NULL(yyjson_obj_get(root, "edges"));
+    ASSERT_NULL(yyjson_obj_get(root, "size_bytes"));
+    ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(root, "indexed_at")));
+    return 0;
+}
+
+/* #2232: a store can open while its count reads fail. CBM_STORE_ERR is not a
+ * count, so the reply must say the read failed instead of reporting a healthy
+ * -1; the healthy 0/0 of an empty project is asserted by the test above. One
+ * failed read is enough, so each table is also dropped on its own. */
+TEST(ui_server_project_health_failed_count_not_healthy) {
+    static const struct {
+        const char *project;
+        const char *damage;
+    } cases[] = {
+        {"health-no-tables", "DROP TABLE nodes; DROP TABLE edges;"},
+        {"health-no-nodes", "DROP TABLE nodes;"},
+        {"health-no-edges", "DROP TABLE edges;"},
+    };
+
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char db_path[1024];
+        ui_delete_db_path(&fx, cases[i].project, db_path, sizeof(db_path));
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, cases[i].project, fx.root_dir), CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_exec(store, cases[i].damage), CBM_STORE_OK);
+        cbm_store_close(store);
+    }
+
+    th_server_t server;
+    ASSERT_EQ(th_server_start(&server), 0);
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        yyjson_doc *reply = ui_health_reply(&server, cases[i].project);
+        failures += ui_health_assert_failed_read(reply);
+        yyjson_doc_free(reply);
+    }
+    th_server_stop(&server);
+    ui_delete_fixture_cleanup(&fx);
+    ASSERT_EQ(failures, 0);
     PASS();
 }
 
@@ -4136,6 +4202,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
     RUN_TEST(ui_server_project_health_timestamp_and_no_watcher);
+    RUN_TEST(ui_server_project_health_failed_count_not_healthy);
     RUN_TEST(ui_server_project_health_live_watcher_state);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_includes_serving_version_issue1820);
